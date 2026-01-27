@@ -2,28 +2,33 @@ import cv2
 import numpy as np
 import tensorflow as tf
 from keras.models import load_model
+from collections import deque
+
 
 
 MODEL_PATH = "models/real_fake_model.h5"
 model = load_model(MODEL_PATH)
-print(" Model loaded")
+print("Model loaded")
 
 
 
 def box_distance(b1, b2):
     x1, y1, w1, h1 = b1
     x2, y2, w2, h2 = b2
-    return abs(x1-x2) + abs(y1-y2) + abs(w1-w2) + abs(h1-h2)
+    return abs(x1 - x2) + abs(y1 - y2) + abs(w1 - w2) + abs(h1 - h2)
 
 
 
-cap = cv2.VideoCapture(1)   # change to 0 if needed
+cap = cv2.VideoCapture(1)   # change to 0 if webcam doesn't open
 kernel = np.ones((5, 5), np.uint8)
 
 LOCK_THRESHOLD = 10
 lock_counter = 0
 locked_box = None
-prediction_text = ""
+
+
+pred_buffer = deque(maxlen=10)
+
 
 
 while True:
@@ -32,33 +37,47 @@ while True:
         break
 
     frame = cv2.resize(frame, (640, 480))
+    H, W = frame.shape[:2]
+    frame_cx, frame_cy = W // 2, H // 2
 
-   
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    blur = cv2.GaussianBlur(hsv, (5, 5), 0)
+    
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    mask = cv2.inRange(
-        blur,
-        np.array([0, 0, 180]),
-        np.array([180, 60, 255])
+    edges = cv2.Canny(blur, 60, 160)
+
+    clean = cv2.morphologyEx(
+        edges,
+        cv2.MORPH_CLOSE,
+        kernel,
+        iterations=2
     )
-
-    clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
     contours, _ = cv2.findContours(
         clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
 
+    
     best_cnt = None
-    best_area = 0
+    best_score = -1
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area > 5000 and area > best_area:
-            best_area = area
+        if area < 3000:
+            continue
+
+        x, y, w, h = cv2.boundingRect(cnt)
+        cx = x + w // 2
+        cy = y + h // 2
+
+        center_dist = abs(cx - frame_cx) + abs(cy - frame_cy)
+        score = area - center_dist * 4
+
+        if score > best_score:
+            best_score = score
             best_cnt = cnt
 
-  
+    
     if best_cnt is not None:
         x, y, w, h = cv2.boundingRect(best_cnt)
         current_box = (x, y, w, h)
@@ -67,60 +86,45 @@ while True:
             locked_box = current_box
             lock_counter = 1
         else:
-            if box_distance(current_box, locked_box) < 20:
+            if box_distance(current_box, locked_box) < 25:
                 lock_counter += 1
             else:
                 locked_box = current_box
-                lock_counter = 0
-                prediction_text = ""
+                lock_counter = max(lock_counter - 1, 0)
+                pred_buffer.clear()
 
         
         if lock_counter >= LOCK_THRESHOLD:
             x, y, w, h = locked_box
-
             roi = frame[y:y+h, x:x+w]
 
             if roi.size > 0:
                 
                 roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                roi_gray = cv2.GaussianBlur(roi_gray, (3, 3), 0)
 
-                roi_thresh = cv2.adaptiveThreshold(
-                    roi_gray,
-                    255,
-                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                    cv2.THRESH_BINARY_INV,
-                    11,
-                    2
-                )
-
-                kernel_small = np.ones((3, 3), np.uint8)
-                roi_clean = cv2.morphologyEx(
-                    roi_thresh,
-                    cv2.MORPH_OPEN,
-                    kernel_small,
-                    iterations=1
-                )
-
-                symbol = cv2.resize(roi_clean, (64, 64))
+                symbol = cv2.resize(roi_gray, (64, 64))
                 symbol = symbol / 255.0
                 symbol = symbol.reshape(1, 64, 64, 1)
 
-               
                 prob = model.predict(symbol, verbose=0)[0][0]
+                pred_buffer.append(prob)
 
-                if prob >= 0.5:
-                    prediction_text = f"REAL ({prob:.2f})"
+                avg_prob = sum(pred_buffer) / len(pred_buffer)
+
+           
+                if avg_prob >= 0.35:
+                    label = f"REAL ({avg_prob:.2f})"
                     color = (0, 255, 0)
                 else:
-                    prediction_text = f"FAKE ({prob:.2f})"
+                    label = f"FAKE ({avg_prob:.2f})"
                     color = (0, 0, 255)
 
-               
                 cv2.rectangle(frame, (x, y), (x+w, y+h), color, 3)
 
                 cv2.putText(
                     frame,
-                    prediction_text,
+                    label,
                     (x, y - 40),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.8,
@@ -138,9 +142,8 @@ while True:
                     2
                 )
 
-                cv2.imshow("Symbol Final", symbol[0])
+                cv2.imshow("Symbol (CNN Input)", symbol[0])
 
-        
         else:
             cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
             cv2.putText(
@@ -153,14 +156,11 @@ while True:
                 2
             )
 
-    
     cv2.imshow("Detection", frame)
-    cv2.imshow("Mask", clean)
+    cv2.imshow("Edge Mask", clean)
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
-
-
 
 
 cap.release()
